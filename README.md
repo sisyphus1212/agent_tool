@@ -1,73 +1,55 @@
 # agent_tool
 
-一个可安装的 Python CLI 项目，用于管理 Hermes 本地会话历史。
+尽可能简单的版本：
 
-安装后提供命令：
+- 一个主脚本：`hhist`
+- 一个安装脚本：`install.sh`
 
-```bash
-hhist
-```
+这样你可以直接拷贝 `hhist` 到别的机器使用；如果想安装到本机 PATH，就运行 `install.sh`。
 
-## 功能
-
-- 按根会话分组列出历史会话
-- 查看完整会话内容
-- 搜索消息内容
-- 导出会话为 JSON
-- 归档 / 恢复会话
-- 软删除会话
-- 硬删除会话（调用 `hermes sessions delete`）
-- 使用 sidecar 元数据库 `~/.hermes/hhist.db`
-
-## 数据设计
-
-- Hermes 原始数据库：`~/.hermes/state.db`
-- hhist 元数据库：`~/.hermes/hhist.db`
-
-原则：
-
-- `state.db` 是 canonical history store
-- 管理状态写入 `hhist.db`
-- `delete` 是软删除
-- `delete --hard` 才会物理删除 Hermes 会话
-
-## 项目结构
+## 文件
 
 ```text
 agent_tool/
-├── bin/
-│   └── hhist
-├── src/
-│   └── agent_tool/
-│       ├── __init__.py
-│       └── cli.py
+├── hhist
+├── install.sh
 ├── .gitignore
-├── LICENSE
-├── pyproject.toml
-├── README.md
-└── hhist
+└── README.md
 ```
 
-## 开发安装
+## 使用方式
 
-在仓库根目录执行：
+直接运行单文件：
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+python3 hhist --list
 ```
 
-安装后可直接运行：
+或者给执行权限后直接运行：
 
 ```bash
-hhist --list
+chmod +x hhist
+./hhist --list
 ```
 
-也可以直接运行包装脚本：
+## 安装
+
+执行：
 
 ```bash
-./bin/hhist --list
+./install.sh
+```
+
+默认会安装到：
+
+```bash
+~/.local/bin/hhist
+```
+
+如果 `~/.local/bin` 不在 PATH，加入：
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ## 常用命令
@@ -100,29 +82,29 @@ hhist <session_id>
 hhist --search keyword
 ```
 
-## 环境要求
+## 依赖
 
-- Python 3.8+
-- Hermes 数据库：`~/.hermes/state.db`
-- 可选：`less`
-- 可选：`hermes` CLI（`delete --hard` 时需要）
+只需要：
 
-## 环境变量
+- Python 3
+- 本机有 `~/.hermes/state.db`
+- 可选：`hermes` CLI（仅 `delete --hard` 时需要）
 
-- `HERMES_HOME`
-- `HHIST_META_DB`
-- `HHIST_LIMIT`
-- `HHIST_SEARCH_LIMIT`
+## 数据说明
 
-## 打包构建
+- Hermes 原始数据库：`~/.hermes/state.db`
+- hhist 元数据库：`~/.hermes/hhist.db`
 
-```bash
-python3 -m build
-```
+原则：
+
+- `state.db` 是原始历史数据
+- `hhist.db` 保存 archive / delete 等管理状态
+- 普通 `delete` 是软删除
+- `delete --hard` 才会真正调用 Hermes 删除会话
 
 ## 快速验证
 
 ```bash
-python3 -m py_compile src/agent_tool/cli.py
-./bin/hhist --list | head
+python3 -m py_compile hhist
+./hhist --list | head
 ```
