@@ -4,8 +4,9 @@
 
 - 一个主脚本：`hhist`
 - 一个安装脚本：`install.sh`
+- 两个 MCP 查询脚本：`jira_mcp_search.sh`、`confluence_mcp_search.sh`
 
-这样你可以直接拷贝 `hhist` 到别的机器使用；如果想安装到本机 PATH，就运行 `install.sh`。
+这样你可以直接拷贝 `hhist` 到别的机器使用；如果想安装到本机 PATH，就运行 `install.sh`。MCP 脚本直接运行即可。
 
 ## 文件
 
@@ -13,11 +14,15 @@
 agent_tool/
 ├── hhist
 ├── install.sh
+├── jira_mcp_search.sh
+├── confluence_mcp_search.sh
 ├── .gitignore
 └── README.md
 ```
 
 ## 使用方式
+
+### hhist
 
 直接运行单文件：
 
@@ -32,7 +37,7 @@ chmod +x hhist
 ./hhist --list
 ```
 
-## 安装
+### 安装
 
 执行：
 
@@ -51,6 +56,26 @@ chmod +x hhist
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
 ```
+
+### JIRA MCP 查询
+
+```bash
+./jira_mcp_search.sh '<TOKEN>' 'key = COR-17556'
+```
+
+- 参数 1：JIRA Bearer Token
+- 参数 2（可选）：JQL 查询语句，默认为 `key = COR-17556`
+
+### Confluence MCP 查询
+
+```bash
+./confluence_mcp_search.sh '<TOKEN>' 'AI各团队key'
+```
+
+- 参数 1：Confluence Bearer Token
+- 参数 2（可选）：搜索关键词，默认为 `AI各团队key`
+
+两个脚本的 MCP 端点均为 `http://10.1.88.121:8087/mcp`。
 
 ## 常用命令
 
