@@ -1,0 +1,70 @@
+#!/bin/sh
+# dpu_master — profile alias wrapper for hermes -p dpu_master
+# Auto-promotes global flags to the correct position before the subcommand.
+
+usage() {
+  cat <<'USAGE'
+Usage: dpu_master [global-flags] <command> [args...]
+
+Global flags:
+  -m MODEL          Set model (e.g. anthropic/claude-sonnet-4)
+  --provider P      Set provider
+  -t TOOLSETS       Comma-separated toolsets
+  -z TEXT           Single query (non-interactive)
+  --resume ID       Resume session by ID or title
+  --continue [N]    Resume by name
+  --worktree        Isolated git worktree mode
+  --skills S        Preload skills (comma-separated)
+  --yolo            Skip command approval
+  --pass-session-id Include session ID in prompt
+  --ignore-rules    Ignore AGENTS.md / .cursorrules
+  --tui             Force TUI mode
+  --dev             Dev mode
+
+Commands:
+  chat        Interactive chat (default)
+  setup       Interactive setup wizard
+  model       Switch model/provider
+  config      View/edit config
+  gateway     Manage messaging gateway
+  doctor      Health check
+  sessions    List/manage sessions
+  cron        Manage cron jobs
+  skills      Browse/install skills
+  tools       Enable/disable tools
+  ...         See `hermes --help` for full list
+
+Examples:
+  dpu_master chat -z "hello"
+  dpu_master -m anthropic/claude-sonnet-4 chat
+  dpu_master setup
+  dpu_master --yolo chat
+USAGE
+  exit 0
+}
+
+if [ $# -eq 0 ]; then
+  usage
+fi
+
+global_flags=""
+rest=""
+pos=0
+for arg in "$@"; do
+  case "$arg" in
+    -m|--provider|-t|--resume|--continue|--worktree|--accept-hooks|\
+    --skills|--yolo|--pass-session-id|--ignore-user-config|\
+    --ignore-rules|--tui|--dev)
+      [ "$pos" -gt 0 ] && rest="$rest $arg" || global_flags="$global_flags $arg"
+      ;;
+    --help|-h)
+      usage
+      ;;
+    *)
+      rest="$rest $arg"
+      pos=1
+      ;;
+  esac
+done
+
+exec hermes -p dpu_master $global_flags $rest
