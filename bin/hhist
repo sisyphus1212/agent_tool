@@ -1,0 +1,860 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+
+DEFAULT_DB = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "state.db"
+CONTENT_JSON_PREFIX = "\x00json:"
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    if not raw.isdigit():
+        print(f"Invalid {name}: {raw}", file=sys.stderr)
+        raise SystemExit(1)
+    return int(raw)
+
+
+DEFAULT_LIMIT = env_int("HHIST_LIMIT", 50)
+DEFAULT_SEARCH_LIMIT = env_int("HHIST_SEARCH_LIMIT", 100)
+
+
+@dataclass
+class Schema:
+    columns: Dict[str, set]
+
+    def has(self, table: str, column: str) -> bool:
+        return column in self.columns.get(table, set())
+
+
+@dataclass
+class Session:
+    id: str
+    parent_session_id: str
+    root_id: str
+    depth: int
+    source: str
+    started_at: float
+    ended_at: Optional[float]
+    end_reason: str
+    last_active: float
+    message_count: int
+    title: str
+    cwd: str = ""
+    archived: int = 0
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def qident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def connect_db(path: Path) -> sqlite3.Connection:
+    if not path.exists():
+        die(f"Hermes DB not found: {path}")
+
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def load_schema(conn: sqlite3.Connection) -> Schema:
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    ).fetchall()
+
+    columns: Dict[str, set] = {}
+
+    for row in rows:
+        table = row["name"]
+        try:
+            columns[table] = {
+                c["name"] for c in conn.execute(f"PRAGMA table_info({qident(table)})")
+            }
+        except sqlite3.DatabaseError:
+            columns[table] = set()
+
+    return Schema(columns)
+
+
+def validate_sid(sid: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", sid):
+        die(f"Invalid session id: {sid}")
+
+
+def row_get(row: sqlite3.Row, key: str, default=None):
+    return row[key] if key in row.keys() else default
+
+
+def fmt_time(ts: Optional[float], short_mode: bool = False) -> str:
+    if ts is None:
+        return ""
+
+    try:
+        text = datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+        return text[:16] if short_mode else text
+    except Exception:
+        return ""
+
+
+def shorten(text: Optional[str], width: int = 22) -> str:
+    text = text or ""
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def strip_title_suffix(title: str) -> str:
+    return re.sub(r" #\d+$", "", title or "")
+
+
+def optional_session_expr(
+    schema: Schema,
+    column: str,
+    default_sql: str,
+    alias: str = "s",
+) -> str:
+    if schema.has("sessions", column):
+        return f"COALESCE({alias}.{column}, {default_sql}) AS {column}"
+    return f"{default_sql} AS {column}"
+
+
+def optional_message_expr(
+    schema: Schema,
+    column: str,
+    default_sql: str,
+    alias: str = "m",
+) -> str:
+    if schema.has("messages", column):
+        return f"COALESCE({alias}.{column}, {default_sql}) AS {column}"
+    return f"{default_sql} AS {column}"
+
+
+def active_clause(schema: Schema, alias: str = "m") -> str:
+    if schema.has("messages", "active"):
+        return f"AND COALESCE({alias}.active, 1) = 1"
+    return ""
+
+
+def decode_content(value):
+    if isinstance(value, str) and value.startswith(CONTENT_JSON_PREFIX):
+        try:
+            return json.loads(value[len(CONTENT_JSON_PREFIX):])
+        except Exception:
+            return value
+    return value
+
+
+def flatten_text(value) -> str:
+    value = decode_content(value)
+
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        return value
+
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def fetch_sessions(conn: sqlite3.Connection, schema: Schema) -> Dict[str, Session]:
+    parent_expr = optional_session_expr(schema, "parent_session_id", "''")
+    cwd_expr = optional_session_expr(schema, "cwd", "''")
+    archived_expr = optional_session_expr(schema, "archived", "0")
+
+    rows = conn.execute(
+        f"""
+        WITH last_msg AS (
+          SELECT
+            session_id,
+            MAX(timestamp) AS last_active
+          FROM messages
+          GROUP BY session_id
+        )
+        SELECT
+          s.id,
+          {parent_expr},
+          COALESCE(s.source, '') AS source,
+          s.started_at,
+          s.ended_at,
+          COALESCE(s.end_reason, '') AS end_reason,
+          COALESCE(l.last_active, s.started_at) AS last_active,
+          COALESCE(s.message_count, 0) AS message_count,
+          COALESCE(s.title, '') AS title,
+          {cwd_expr},
+          {archived_expr}
+        FROM sessions s
+        LEFT JOIN last_msg l ON l.session_id = s.id
+        """
+    ).fetchall()
+
+    sessions: Dict[str, Session] = {}
+
+    for row in rows:
+        sid = row["id"]
+
+        sessions[sid] = Session(
+            id=sid,
+            parent_session_id=row["parent_session_id"] or "",
+            root_id="",
+            depth=0,
+            source=row["source"] or "",
+            started_at=float(row["started_at"] or 0),
+            ended_at=float(row["ended_at"]) if row["ended_at"] is not None else None,
+            end_reason=row["end_reason"] or "",
+            last_active=float(row["last_active"] or row["started_at"] or 0),
+            message_count=int(row["message_count"] or 0),
+            title=row["title"] or "",
+            cwd=row["cwd"] or "",
+            archived=int(row["archived"] or 0),
+        )
+
+    assign_roots(sessions)
+    return sessions
+
+
+def root_and_depth(sid: str, sessions: Dict[str, Session]) -> Tuple[str, int]:
+    seen = set()
+    cur = sid
+    depth = 0
+
+    while True:
+        if cur in seen:
+            return sid, 0
+
+        seen.add(cur)
+        session = sessions.get(cur)
+
+        if not session:
+            return sid, depth
+
+        parent = session.parent_session_id
+
+        if not parent or parent not in sessions:
+            return cur, depth
+
+        cur = parent
+        depth += 1
+
+
+def assign_roots(sessions: Dict[str, Session]) -> None:
+    for sid, session in sessions.items():
+        root, depth = root_and_depth(sid, sessions)
+        session.root_id = root
+        session.depth = depth
+
+
+def group_items(root_id: str, sessions: Dict[str, Session]) -> List[Session]:
+    children: Dict[str, List[Session]] = {}
+
+    for session in sessions.values():
+        if session.root_id != root_id:
+            continue
+        children.setdefault(session.parent_session_id, []).append(session)
+
+    for child_list in children.values():
+        child_list.sort(key=lambda x: (x.started_at, x.id))
+
+    result: List[Session] = []
+
+    def walk(session: Session) -> None:
+        result.append(session)
+        for child in children.get(session.id, []):
+            walk(child)
+
+    root = sessions.get(root_id)
+
+    if root:
+        walk(root)
+
+    seen = {s.id for s in result}
+
+    for session in sorted(
+        [s for s in sessions.values() if s.root_id == root_id and s.id not in seen],
+        key=lambda x: (x.started_at, x.id),
+    ):
+        result.append(session)
+
+    return result
+
+
+def grouped_sessions(sessions: Dict[str, Session]) -> List[Tuple[Session, List[Session]]]:
+    root_ids = sorted({s.root_id or s.id for s in sessions.values()})
+    groups: List[Tuple[Session, List[Session]]] = []
+
+    for root_id in root_ids:
+        items = group_items(root_id, sessions)
+        if not items:
+            continue
+
+        root = sessions.get(root_id) or items[0]
+        groups.append((root, items))
+
+    groups.sort(key=lambda pair: max(s.last_active for s in pair[1]), reverse=True)
+    return groups
+
+
+def group_title(root: Session, items: List[Session]) -> str:
+    if root.title:
+        return strip_title_suffix(root.title)
+
+    for session in items:
+        if session.title:
+            return strip_title_suffix(session.title)
+
+    return "(untitled)"
+
+
+def resolve_sid(conn: sqlite3.Connection, sid_or_prefix: str) -> str:
+    validate_sid(sid_or_prefix)
+
+    row = conn.execute(
+        "SELECT id FROM sessions WHERE id = ?",
+        (sid_or_prefix,),
+    ).fetchone()
+
+    if row:
+        return row["id"]
+
+    rows = conn.execute(
+        "SELECT id FROM sessions WHERE id LIKE ? ORDER BY started_at DESC LIMIT 2",
+        (sid_or_prefix + "%",),
+    ).fetchall()
+
+    if len(rows) == 1:
+        return rows[0]["id"]
+
+    if len(rows) > 1:
+        die(f"Ambiguous session id prefix: {sid_or_prefix}")
+
+    die(f"Session not found: {sid_or_prefix}")
+
+
+def session_group(conn: sqlite3.Connection, schema: Schema, sid: str) -> List[Session]:
+    sid = resolve_sid(conn, sid)
+    sessions = fetch_sessions(conn, schema)
+
+    if sid not in sessions:
+        die(f"Session not found: {sid}")
+
+    root_id = sessions[sid].root_id or sid
+    return group_items(root_id, sessions)
+
+
+def print_list(conn: sqlite3.Connection, schema: Schema, limit: int) -> None:
+    sessions = fetch_sessions(conn, schema)
+    groups = grouped_sessions(sessions)[:limit]
+
+    print(
+        f"{'No':<4} {'RootSessionID':<22} {'SessionID':<22} "
+        f"{'Msgs':>5} {'LastActive':<16} Title"
+    )
+    print("-" * 108)
+
+    idx = 1
+
+    for root, items in groups:
+        for item_idx, session in enumerate(items):
+            root_col = root.id if item_idx == 0 else ""
+
+            print(
+                f"{idx:<4} "
+                f"{root_col:<22} "
+                f"{session.id:<22} "
+                f"{session.message_count:>5} "
+                f"{fmt_time(session.last_active, short_mode=True):<16} "
+                f"{session.title}"
+            )
+
+            idx += 1
+
+
+def fetch_messages(
+    conn: sqlite3.Connection,
+    schema: Schema,
+    ids: Iterable[str],
+    include_inactive: bool = False,
+) -> List[sqlite3.Row]:
+    ids = list(ids)
+
+    if not ids:
+        return []
+
+    placeholders = ",".join("?" for _ in ids)
+    active = "" if include_inactive else active_clause(schema, "m")
+
+    return conn.execute(
+        f"""
+        SELECT m.*
+        FROM messages m
+        JOIN sessions s ON s.id = m.session_id
+        WHERE m.session_id IN ({placeholders})
+          {active}
+        ORDER BY s.started_at, m.id
+        """,
+        ids,
+    ).fetchall()
+
+
+def message_to_dict(row: sqlite3.Row) -> dict:
+    data = dict(row)
+
+    if "content" in data:
+        data["content"] = decode_content(data["content"])
+
+    return data
+
+
+def render_message(row: sqlite3.Row) -> str:
+    data = message_to_dict(row)
+
+    parts = [f"[{data.get('role', '')}]"]
+
+    content = data.get("content")
+    if content not in (None, ""):
+        if isinstance(content, (list, dict)):
+            parts.append(json.dumps(content, ensure_ascii=False, indent=2))
+        else:
+            parts.append(str(content))
+
+    if data.get("tool_name"):
+        parts.append(f"[tool] {data.get('tool_name')}")
+
+    if data.get("tool_calls"):
+        parts.append("[tool_calls]")
+        parts.append(str(data.get("tool_calls")))
+
+    if data.get("reasoning_content"):
+        parts.append("[reasoning_content]")
+        parts.append(str(data.get("reasoning_content")))
+
+    parts.append("---")
+    return "\n".join(parts)
+
+
+def page(text: str) -> None:
+    if shutil.which("less") and sys.stdout.isatty():
+        proc = subprocess.Popen(["less", "-R"], stdin=subprocess.PIPE, text=True)
+        try:
+            proc.communicate(text)
+        except BrokenPipeError:
+            pass
+    else:
+        print(text)
+
+
+def show_conversation(
+    conn: sqlite3.Connection,
+    schema: Schema,
+    sid: str,
+    include_inactive: bool = False,
+) -> None:
+    items = session_group(conn, schema, sid)
+    ids = [s.id for s in items]
+    titles = {s.id: s.title for s in items}
+
+    messages = fetch_messages(
+        conn,
+        schema,
+        ids,
+        include_inactive=include_inactive,
+    )
+
+    lines = [
+        f"Root      : {items[0].root_id or items[0].id}",
+        f"Sessions  : {len(items)}",
+        f"Msgs      : {sum(s.message_count for s in items)}",
+        f"Title     : {group_title(items[0], items)}",
+        f"SessionIDs: {', '.join(ids)}",
+        "-" * 100,
+    ]
+
+    current_sid = None
+
+    for message in messages:
+        sid2 = message["session_id"]
+
+        if sid2 != current_sid:
+            current_sid = sid2
+            lines.append("")
+            lines.append("=" * 100)
+            lines.append(f"SessionID: {sid2}")
+            lines.append(f"Title    : {titles.get(sid2, '')}")
+            lines.append("=" * 100)
+
+        lines.append(render_message(message))
+
+    page("\n".join(lines))
+
+
+def dump_json(
+    conn: sqlite3.Connection,
+    schema: Schema,
+    sid: str,
+    include_inactive: bool,
+) -> None:
+    items = session_group(conn, schema, sid)
+    ids = [s.id for s in items]
+    messages = fetch_messages(
+        conn,
+        schema,
+        ids,
+        include_inactive=include_inactive,
+    )
+
+    out = {
+        "type": "parent_session_group",
+        "root_session_id": items[0].root_id or items[0].id,
+        "session_ids": ids,
+        "sessions": [asdict(s) for s in items],
+        "messages": [message_to_dict(m) for m in messages],
+    }
+
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+
+
+def print_schema(conn: sqlite3.Connection) -> None:
+    version = None
+
+    try:
+        row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+        version = row["version"] if row else None
+    except sqlite3.DatabaseError:
+        version = None
+
+    print(f"schema_version: {version if version is not None else '(none)'}")
+
+    tables = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    ).fetchall()
+
+    for table_row in tables:
+        table = table_row["name"]
+        print(f"\n[{table}]")
+
+        for row in conn.execute(f"PRAGMA table_info({qident(table)})"):
+            pk = " PK" if row["pk"] else ""
+            nn = " NOTNULL" if row["notnull"] else ""
+            default = f" DEFAULT {row['dflt_value']}" if row["dflt_value"] is not None else ""
+            print(f"  {row['name']}: {row['type']}{pk}{nn}{default}")
+
+
+def make_snippet(text: str, keyword: str, width: int = 220) -> str:
+    text = re.sub(r"\s+", " ", text or "").strip()
+
+    if not text:
+        return ""
+
+    pos = text.lower().find(keyword.lower())
+
+    if pos < 0:
+        return text[:width]
+
+    start = max(0, pos - 80)
+    end = min(len(text), pos + width - 80)
+
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+
+    return prefix + text[start:end] + suffix
+
+
+def search_messages(
+    conn: sqlite3.Connection,
+    schema: Schema,
+    keyword: str,
+    session_id: Optional[str],
+    limit: int,
+    include_inactive: bool = False,
+) -> None:
+    if not keyword:
+        die("Usage: hhist search [--session <session_id>] <keyword>")
+
+    sessions = fetch_sessions(conn, schema)
+
+    scope_ids: Optional[List[str]] = None
+
+    if session_id:
+        items = session_group(conn, schema, session_id)
+        scope_ids = [s.id for s in items]
+
+    active = "" if include_inactive else active_clause(schema, "m")
+
+    select_content = optional_message_expr(schema, "content", "''")
+    select_tool_name = optional_message_expr(schema, "tool_name", "''")
+    select_tool_calls = optional_message_expr(schema, "tool_calls", "''")
+
+    predicates = []
+    params: List[str] = []
+    like = f"%{keyword}%"
+
+    def add(sql: str) -> None:
+        predicates.append(sql)
+        params.append(like)
+
+    if schema.has("messages", "content"):
+        add("COALESCE(m.content, '') LIKE ?")
+
+    if schema.has("messages", "tool_name"):
+        add("COALESCE(m.tool_name, '') LIKE ?")
+
+    if schema.has("messages", "tool_calls"):
+        add("COALESCE(m.tool_calls, '') LIKE ?")
+
+    if schema.has("sessions", "title"):
+        add("COALESCE(s.title, '') LIKE ?")
+
+    add("s.id LIKE ?")
+
+    if schema.has("sessions", "parent_session_id"):
+        add("COALESCE(s.parent_session_id, '') LIKE ?")
+
+    if not predicates:
+        print(f"No searchable columns for: {keyword}")
+        return
+
+    scope_sql = ""
+    scope_params: List[str] = []
+
+    if scope_ids is not None:
+        placeholders = ",".join("?" for _ in scope_ids)
+        scope_sql = f"AND m.session_id IN ({placeholders})"
+        scope_params.extend(scope_ids)
+
+    rows = conn.execute(
+        f"""
+        WITH last_msg AS (
+          SELECT
+            session_id,
+            MAX(timestamp) AS last_active
+          FROM messages
+          GROUP BY session_id
+        )
+        SELECT
+          m.id AS message_id,
+          m.session_id,
+          m.timestamp,
+          m.role,
+          {select_content},
+          {select_tool_name},
+          {select_tool_calls},
+          COALESCE(s.title, '') AS title,
+          COALESCE(s.message_count, 0) AS message_count,
+          COALESCE(l.last_active, s.started_at) AS last_active
+        FROM messages m
+        JOIN sessions s ON s.id = m.session_id
+        LEFT JOIN last_msg l ON l.session_id = s.id
+        WHERE 1 = 1
+          {active}
+          {scope_sql}
+          AND ({' OR '.join(predicates)})
+        ORDER BY last_active DESC, m.session_id, m.id
+        LIMIT ?
+        """,
+        (*scope_params, *params, limit),
+    ).fetchall()
+
+    if not rows:
+        if session_id:
+            print(f"No matched message in session group {session_id!r} for: {keyword}")
+        else:
+            print(f"No matched message for: {keyword}")
+        return
+
+    print(
+        f"{'RootSessionID':<22} {'SessionID':<22} "
+        f"{'MsgID':>6} {'Time':<16} {'Role':<10} Snippet"
+    )
+    print("-" * 130)
+
+    for row in rows:
+        sid = row["session_id"]
+        root = sessions[sid].root_id if sid in sessions else sid
+
+        text_candidates = [
+            flatten_text(row["content"]),
+            flatten_text(row["tool_calls"]),
+            flatten_text(row["tool_name"]),
+            flatten_text(row["title"]),
+        ]
+
+        snippet = ""
+
+        for candidate in text_candidates:
+            if keyword.lower() in candidate.lower():
+                snippet = make_snippet(candidate, keyword)
+                break
+
+        if not snippet:
+            snippet = make_snippet(" ".join(text_candidates), keyword)
+
+        print(
+            f"{shorten(root):<22} "
+            f"{shorten(sid):<22} "
+            f"{row['message_id']:>6} "
+            f"{fmt_time(row['timestamp'], short_mode=True):<16} "
+            f"{str(row['role'] or ''):<10} "
+            f"{snippet}"
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="hhist",
+        description="Hermes SQLite history viewer.",
+    )
+
+    parser.add_argument(
+        "--db",
+        default=str(DEFAULT_DB),
+        help="path to Hermes state.db",
+    )
+
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="list sessions grouped by root conversation",
+    )
+
+    parser.add_argument(
+        "--schema",
+        action="store_true",
+        help="print detected schema",
+    )
+
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_list = sub.add_parser("list", help="list sessions grouped by root conversation")
+    p_list.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+
+    p_show = sub.add_parser("show", help="show one full conversation by session id")
+    p_show.add_argument("session_id")
+    p_show.add_argument(
+        "--include-inactive",
+        action="store_true",
+        help="include inactive messages if DB has messages.active",
+    )
+
+    p_search = sub.add_parser("search", help="search messages globally or inside one session group")
+    p_search.add_argument(
+        "--session",
+        "-S",
+        dest="session_id",
+        help="restrict search to the parent-chain group containing this session id",
+    )
+    p_search.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_SEARCH_LIMIT,
+    )
+    p_search.add_argument(
+        "--include-inactive",
+        action="store_true",
+        help="include inactive messages if DB has messages.active",
+    )
+    p_search.add_argument("keyword", nargs="+")
+
+    p_dump = sub.add_parser("dump", help="dump one full conversation group as JSON")
+    p_dump.add_argument("session_id")
+    p_dump.add_argument(
+        "--include-inactive",
+        action="store_true",
+        help="include inactive messages if DB has messages.active",
+    )
+
+    parser.add_argument(
+        "legacy_session_id",
+        nargs="?",
+        help="compat: hhist <session_id> is same as hhist show <session_id>",
+    )
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help="list limit",
+    )
+
+    return parser
+
+
+def main() -> None:
+    # compatibility:
+    #   hhist -l
+    #   hhist --list
+    #   hhist <session_id>
+    argv = sys.argv[1:]
+
+    if argv == ["-l"]:
+        argv = ["--list"]
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    conn = connect_db(Path(args.db))
+    schema = load_schema(conn)
+
+    if args.schema:
+        print_schema(conn)
+        return
+
+    if args.cmd == "list" or args.list:
+        limit = getattr(args, "limit", DEFAULT_LIMIT)
+        print_list(conn, schema, limit)
+        return
+
+    if args.cmd == "show":
+        show_conversation(
+            conn,
+            schema,
+            args.session_id,
+            include_inactive=args.include_inactive,
+        )
+        return
+
+    if args.cmd == "search":
+        search_messages(
+            conn,
+            schema,
+            " ".join(args.keyword),
+            session_id=args.session_id,
+            limit=args.limit,
+            include_inactive=args.include_inactive,
+        )
+        return
+
+    if args.cmd == "dump":
+        dump_json(
+            conn,
+            schema,
+            args.session_id,
+            include_inactive=args.include_inactive,
+        )
+        return
+
+    if args.legacy_session_id:
+        show_conversation(conn, schema, args.legacy_session_id)
+        return
+
+    print_list(conn, schema, args.limit)
+
+
+if __name__ == "__main__":
+    main()
