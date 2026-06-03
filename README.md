@@ -10,15 +10,14 @@
 
 ## 文件
 
-```text
-agent_tool/
-├── hhist
-├── install.sh
-├── jira_mcp_search.sh
-├── confluence_mcp_search.sh
-├── .gitignore
-└── README.md
-```
+| 文件 | 说明 |
+|------|------|
+| `hhist` | 主脚本：Hermes 会话历史管理（list/show/search/archive/delete） |
+| `install.sh` | 安装脚本：将 `hhist` 安装到 `~/.local/bin/` |
+| `jira_mcp_search.sh` | JIRA MCP 查询脚本：通过流式 MCP 端点执行 JQL 搜索 |
+| `confluence_mcp_search.sh` | Confluence MCP 查询脚本：通过流式 MCP 端点执行页面搜索 |
+| `.gitignore` | Git 忽略规则 |
+| `README.md` | 项目说明文档 |
 
 ## 使用方式
 
