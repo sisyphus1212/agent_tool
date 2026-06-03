@@ -4,7 +4,7 @@ hhist - Hermes SQLite history manager.
 
 Design:
   * Hermes state.db is treated as the canonical history store.
-  * hhist local metadata is stored in a sidecar DB: ~/.hermes/hhist.db.
+  * hhist local metadata is stored profile-locally by default: <HERMES_HOME>/hhist.db.
   * archive / soft delete / tags / notes modify only hhist.db.
   * delete = soft delete in hhist.db only.
   * delete --hard = physical delete via official `hermes sessions delete`.
@@ -17,9 +17,9 @@ Compatibility:
   hhist --search keyword
 
 Primary commands:
-  hhist list [--all|--active|--archived|--deleted]
+  hhist list [--all|--active|--archived|--deleted] [--profile NAME|--all-profiles]
   hhist show <session_id>
-  hhist search <keyword> [--session <session_id>]
+  hhist search <keyword> [--session <session_id>] [--profile NAME|--all-profiles]
   hhist archive <session_id> [--group|--children]
   hhist restore <session_id> [--group|--children]
   hhist delete <session_id> [--group|--children]
@@ -43,11 +43,49 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-DEFAULT_DB = HERMES_HOME / "state.db"
-DEFAULT_META_DB = Path(os.environ.get("HHIST_META_DB", str(HERMES_HOME / "hhist.db")))
+PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 CONTENT_JSON_PREFIX = "\x00json:"
 MAX_SQL_VARS = 900
+
+
+def get_hermes_home() -> Path:
+    """Match Hermes: HERMES_HOME overrides, otherwise ~/.hermes."""
+    raw = os.environ.get("HERMES_HOME", "").strip()
+    return Path(raw).expanduser() if raw else Path.home() / ".hermes"
+
+
+def get_default_hermes_root() -> Path:
+    """Approximate Hermes get_default_hermes_root() for profile discovery.
+
+    * default/local install: ~/.hermes
+    * profile HERMES_HOME: <root>/profiles/<name> -> <root>
+    * custom/docker HERMES_HOME: HERMES_HOME itself, unless it is a profile path
+    """
+    native = Path.home() / ".hermes"
+    env_home = os.environ.get("HERMES_HOME", "").strip()
+    if not env_home:
+        return native
+    env_path = Path(env_home).expanduser()
+    try:
+        env_path.resolve().relative_to(native.resolve())
+        return native
+    except Exception:
+        pass
+    if env_path.parent.name == "profiles":
+        return env_path.parent.parent
+    return env_path
+
+
+def profile_name_from_home(root: Path, home: Path) -> str:
+    try:
+        if home.resolve() == root.resolve():
+            return "default"
+        rel = home.resolve().relative_to((root / "profiles").resolve())
+        if len(rel.parts) == 1 and PROFILE_ID_RE.fullmatch(rel.parts[0]):
+            return rel.parts[0]
+    except Exception:
+        pass
+    return home.name or "custom"
 
 
 def env_int(name: str, default: int) -> int:
@@ -61,6 +99,15 @@ def env_int(name: str, default: int) -> int:
 
 DEFAULT_LIMIT = env_int("HHIST_LIMIT", 50)
 DEFAULT_SEARCH_LIMIT = env_int("HHIST_SEARCH_LIMIT", 100)
+
+
+@dataclass
+class Profile:
+    name: str
+    home: Path
+    db_path: Path
+    meta_db_path: Path
+    is_default: bool = False
 
 
 @dataclass
@@ -171,6 +218,118 @@ def connect_meta_db(path: Path) -> sqlite3.Connection:
     ensure_meta_schema(conn)
     return conn
 
+
+
+
+def normalize_profile_name(name: str) -> str:
+    raw = str(name).strip()
+    if not raw:
+        die("Profile name cannot be empty")
+    if raw.casefold() == "default":
+        return "default"
+    return raw.lower()
+
+
+def profile_home(root: Path, name: str) -> Path:
+    name = normalize_profile_name(name)
+    if name == "default":
+        return root
+    if not PROFILE_ID_RE.fullmatch(name):
+        die(f"Invalid profile name: {name}")
+    return root / "profiles" / name
+
+
+def discover_profiles(root: Path, meta_db_override: Optional[Path] = None) -> List[Profile]:
+    """Discover Hermes profiles using the upstream layout.
+
+    The default profile is the root itself. Named profiles are direct children
+    of <root>/profiles/ whose names match Hermes' profile id regex.
+    """
+    root = root.expanduser()
+    profiles: List[Profile] = []
+
+    candidates: List[Tuple[str, Path, bool]] = [("default", root, True)]
+    profiles_root = root / "profiles"
+    if profiles_root.is_dir():
+        for entry in sorted(profiles_root.iterdir()):
+            if entry.is_dir() and PROFILE_ID_RE.fullmatch(entry.name):
+                candidates.append((entry.name, entry, False))
+
+    seen: Set[Path] = set()
+    for name, home, is_default in candidates:
+        try:
+            key = home.resolve()
+        except Exception:
+            key = home
+        if key in seen:
+            continue
+        seen.add(key)
+        db_path = home / "state.db"
+        meta_path = meta_db_override if meta_db_override else home / "hhist.db"
+        profiles.append(Profile(name, home, db_path, meta_path, is_default=is_default))
+    return profiles
+
+
+def profile_from_db(db_path: Path, meta_db_override: Optional[Path] = None) -> Profile:
+    db_path = db_path.expanduser()
+    home = db_path.parent
+    root = get_default_hermes_root()
+    return Profile(
+        name=profile_name_from_home(root, home),
+        home=home,
+        db_path=db_path,
+        meta_db_path=meta_db_override if meta_db_override else home / "hhist.db",
+        is_default=False,
+    )
+
+
+def select_profiles(args: argparse.Namespace, require_db: bool = True) -> List[Profile]:
+    meta_override = Path(args.meta_db).expanduser() if getattr(args, "meta_db", None) else None
+
+    if getattr(args, "db", None):
+        profiles = [profile_from_db(Path(args.db), meta_override)]
+    else:
+        root = Path(getattr(args, "root", None) or get_default_hermes_root()).expanduser()
+        if getattr(args, "all_profiles", False):
+            profiles = discover_profiles(root, meta_override)
+        elif getattr(args, "profile", None):
+            home = profile_home(root, args.profile)
+            profiles = [Profile(
+                normalize_profile_name(args.profile),
+                home,
+                home / "state.db",
+                meta_override if meta_override else home / "hhist.db",
+                is_default=(normalize_profile_name(args.profile) == "default"),
+            )]
+        else:
+            home = get_hermes_home()
+            name = profile_name_from_home(root, home)
+            profiles = [Profile(name, home, home / "state.db", meta_override if meta_override else home / "hhist.db", name == "default")]
+
+    if require_db:
+        profiles = [p for p in profiles if p.db_path.exists()]
+        if not profiles:
+            die("No Hermes state.db found for selected profile scope")
+    return profiles
+
+
+def open_profile(profile: Profile) -> Tuple[sqlite3.Connection, sqlite3.Connection, Schema]:
+    conn = connect_hermes_db(profile.db_path, writable=False)
+    meta = connect_meta_db(profile.meta_db_path)
+    schema = load_schema(conn)
+    return conn, meta, schema
+
+
+def print_profiles_table(profiles: List[Profile]) -> None:
+    print(f"{'Profile':<18} {'DB':<6} {'Meta':<6} Home")
+    print("-" * 110)
+    for p in profiles:
+        print(
+            f"{p.name:<18} "
+            f"{('yes' if p.db_path.exists() else 'no'):<6} "
+            f"{('yes' if p.meta_db_path.exists() else 'no'):<6} "
+            f"{p.home}"
+        )
 
 def ensure_meta_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(
@@ -549,6 +708,29 @@ def resolve_sid(conn: sqlite3.Connection, sid_or_prefix: str) -> str:
     die(f"Session not found: {sid_or_prefix}")
 
 
+
+
+def try_resolve_sid(conn: sqlite3.Connection, sid_or_prefix: str) -> Tuple[Optional[str], Optional[str]]:
+    """Non-printing resolver for cross-profile probing.
+
+    Returns (session_id, error). error is one of: invalid, ambiguous, not_found.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", sid_or_prefix):
+        return None, "invalid"
+    row = conn.execute("SELECT id FROM sessions WHERE id = ?", (sid_or_prefix,)).fetchone()
+    if row:
+        return row["id"], None
+    rows = conn.execute(
+        "SELECT id FROM sessions WHERE id LIKE ? ORDER BY started_at DESC LIMIT 2",
+        (sid_or_prefix + "%",),
+    ).fetchall()
+    if len(rows) == 1:
+        return rows[0]["id"], None
+    if len(rows) > 1:
+        return None, "ambiguous"
+    return None, "not_found"
+
+
 def target_sessions(
     conn: sqlite3.Connection,
     schema: Schema,
@@ -877,7 +1059,7 @@ def fts_search_rows(
             ORDER BY last_active DESC, m.session_id, m.id
             LIMIT ?
             """,
-            (*scope_params, keyword, limit),
+            (keyword, *scope_params, limit),
         ).fetchall()
     except sqlite3.DatabaseError:
         return None
@@ -1196,13 +1378,16 @@ def mark_hard_deleted(meta: sqlite3.Connection, items: List[Session]) -> None:
             )
 
 
-def call_hermes_delete(session_id: str) -> None:
+def call_hermes_delete(session_id: str, hermes_home: Optional[Path] = None) -> None:
     hermes = shutil.which("hermes")
     if not hermes:
         die("Cannot find `hermes` in PATH. Hard delete aborted.")
 
     cmd = [hermes, "sessions", "delete", session_id]
-    proc = subprocess.run(cmd, text=True)
+    env = os.environ.copy()
+    if hermes_home is not None:
+        env["HERMES_HOME"] = str(hermes_home)
+    proc = subprocess.run(cmd, text=True, env=env)
     if proc.returncode != 0:
         die(f"Hermes delete failed for {session_id}")
 
@@ -1233,14 +1418,14 @@ def scope_name(args: argparse.Namespace) -> str:
     return "single"
 
 
-def run_delete(args: argparse.Namespace, conn: sqlite3.Connection, schema: Schema, meta: sqlite3.Connection) -> None:
+def run_delete(args: argparse.Namespace, conn: sqlite3.Connection, schema: Schema, meta: sqlite3.Connection, hermes_home: Optional[Path] = None) -> None:
     items = target_sessions(conn, schema, meta, args.session_id, args.group, args.children)
     action = "HARD_DELETE" if args.hard else "SOFT_DELETE"
     print_target_summary(action, items)
 
     if args.hard:
         for s in sorted(items, key=lambda x: x.depth, reverse=True):
-            call_hermes_delete(s.id)
+            call_hermes_delete(s.id, hermes_home=hermes_home)
         mark_hard_deleted(meta, items)
         for s in items:
             log_operation(meta, "hard_delete", s.id, scope_name(args))
@@ -1324,13 +1509,20 @@ def build_parser() -> argparse.ArgumentParser:
         description="Hermes SQLite history viewer with sidecar archive/delete/search management.",
     )
 
-    parser.add_argument("--db", default=str(DEFAULT_DB), help="path to Hermes state.db")
-    parser.add_argument("--meta-db", default=str(DEFAULT_META_DB), help="path to hhist sidecar DB")
+    parser.add_argument("--db", help="path to one Hermes state.db; bypasses profile discovery")
+    parser.add_argument("--meta-db", help="path to one hhist sidecar DB; default is <profile>/hhist.db")
+    parser.add_argument("--root", help="Hermes root for profile discovery; default follows Hermes HERMES_HOME logic")
+    pscope = parser.add_mutually_exclusive_group()
+    pscope.add_argument("--profile", "-p", help="target one Hermes profile by name; default uses current HERMES_HOME")
+    pscope.add_argument("--all-profiles", action="store_true", help="target every discovered profile")
     parser.add_argument("--schema", action="store_true", help="print detected Hermes and hhist schemas")
     parser.add_argument("--list", action="store_true", help="compat: list sessions")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT, help="compat list limit")
 
     sub = parser.add_subparsers(dest="cmd")
+
+    p_profiles = sub.add_parser("profiles", help="list detected Hermes profiles and DB locations")
+    p_profiles.add_argument("--only-with-db", action="store_true", help="show only profiles that have state.db")
 
     p_list = sub.add_parser("list", help="list sessions grouped by root conversation")
     p_list.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
@@ -1390,23 +1582,18 @@ def normalize_legacy_args(argv: List[str]) -> List[str]:
     return argv
 
 
-def main() -> None:
-    argv = normalize_legacy_args(sys.argv[1:])
-    parser = build_parser()
-    args = parser.parse_args(argv)
 
-    hermes_db = Path(args.db)
-    meta_db = Path(args.meta_db)
 
-    conn = connect_hermes_db(hermes_db, writable=False)
-    meta = connect_meta_db(meta_db)
-    schema = load_schema(conn)
+def selected_profile_label(profile: Profile, total: int) -> str:
+    return f"[{profile.name}] " if total > 1 else ""
 
-    if args.schema:
-        print_schema(conn, meta)
-        return
 
-    if args.cmd == "list" or args.list:
+def run_list_for_profiles(args: argparse.Namespace, profiles: List[Profile]) -> None:
+    total = len(profiles)
+    for idx, profile in enumerate(profiles):
+        conn, meta, schema = open_profile(profile)
+        if total > 1:
+            print(f"\n## Profile: {profile.name}  ({profile.home})")
         print_list(
             conn,
             schema,
@@ -1415,13 +1602,47 @@ def main() -> None:
             state_filter=getattr(args, "state_filter", "active"),
             flat=getattr(args, "flat", False),
         )
-        return
+        conn.close()
+        meta.close()
 
-    if args.cmd == "show":
-        show_conversation(conn, schema, meta, args.session_id, include_inactive=args.include_inactive)
-        return
 
-    if args.cmd == "search":
+def resolve_session_profile(
+    profiles: List[Profile],
+    sid_or_prefix: str,
+    allow_ambiguous: bool = False,
+) -> Tuple[Profile, sqlite3.Connection, sqlite3.Connection, Schema, str]:
+    matches: List[Tuple[Profile, sqlite3.Connection, sqlite3.Connection, Schema, str]] = []
+    errors: List[str] = []
+    for profile in profiles:
+        try:
+            conn, meta, schema = open_profile(profile)
+            sid, err = try_resolve_sid(conn, sid_or_prefix)
+            if sid:
+                matches.append((profile, conn, meta, schema, sid))
+            else:
+                errors.append(f"{profile.name}: {err}")
+                conn.close()
+                meta.close()
+        except Exception as e:
+            errors.append(f"{profile.name}: {e}")
+
+    if not matches:
+        die(f"Session not found in selected profiles: {sid_or_prefix}")
+    if len(matches) > 1 and not allow_ambiguous:
+        for m in matches:
+            m[1].close()
+            m[2].close()
+        names = ", ".join(m[0].name for m in matches)
+        die(f"Ambiguous session id across profiles: {sid_or_prefix}. Matches: {names}. Use --profile NAME.")
+    return matches[0]
+
+
+def run_search_for_profiles(args: argparse.Namespace, profiles: List[Profile]) -> None:
+    total = len(profiles)
+    for profile in profiles:
+        conn, meta, schema = open_profile(profile)
+        if total > 1:
+            print(f"\n## Profile: {profile.name}  ({profile.home})")
         search_messages(
             conn,
             schema,
@@ -1433,53 +1654,108 @@ def main() -> None:
             state_filter=args.state_filter,
             engine=args.engine,
         )
+        conn.close()
+        meta.close()
+
+
+def run_schema_for_profiles(profiles: List[Profile]) -> None:
+    total = len(profiles)
+    for profile in profiles:
+        conn, meta, schema = open_profile(profile)
+        if total > 1:
+            print(f"\n## Profile: {profile.name}  ({profile.home})")
+        print_schema(conn, meta)
+        conn.close()
+        meta.close()
+
+def main() -> None:
+    argv = normalize_legacy_args(sys.argv[1:])
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.cmd == "profiles":
+        profiles = select_profiles(args, require_db=False)
+        if getattr(args, "only_with_db", False):
+            profiles = [p for p in profiles if p.db_path.exists()]
+        print_profiles_table(profiles)
         return
 
-    if args.cmd == "dump":
-        dump_json(conn, schema, meta, args.session_id, include_inactive=args.include_inactive)
+    profiles = select_profiles(args, require_db=True)
+
+    if args.schema:
+        run_schema_for_profiles(profiles)
         return
 
-    if args.cmd == "archive":
-        run_archive(args, conn, schema, meta)
+    if args.cmd == "list" or args.list or (args.cmd is None and not args.legacy_session_id):
+        run_list_for_profiles(args, profiles)
         return
 
-    if args.cmd == "restore":
-        run_restore(args, conn, schema, meta)
+    if args.cmd == "search":
+        run_search_for_profiles(args, profiles)
         return
 
-    if args.cmd == "delete":
-        run_delete(args, conn, schema, meta)
+    if args.cmd in ("show", "dump") or args.legacy_session_id:
+        sid_arg = args.legacy_session_id if args.legacy_session_id else args.session_id
+        profile, conn, meta, schema, sid = resolve_session_profile(profiles, sid_arg)
+        if len(profiles) > 1:
+            print(f"Profile: {profile.name}  ({profile.home})")
+        if args.cmd == "dump":
+            dump_json(conn, schema, meta, sid, include_inactive=args.include_inactive)
+        else:
+            include_inactive = getattr(args, "include_inactive", False)
+            show_conversation(conn, schema, meta, sid, include_inactive=include_inactive)
+        conn.close()
+        meta.close()
         return
 
-    if args.cmd == "note":
-        sid = resolve_sid(conn, args.session_id)
-        set_note(meta, sid, " ".join(args.note))
-        log_operation(meta, "note", sid, "single", {"note": " ".join(args.note)})
-        print(f"Note updated: {sid}")
-        return
+    # Mutating commands intentionally operate on one resolved profile. With
+    # --all-profiles, a session id prefix must be unique across selected profiles.
+    if args.cmd in ("archive", "restore", "delete", "note", "tags"):
+        profile, conn, meta, schema, sid = resolve_session_profile(profiles, args.session_id)
+        args.session_id = sid
+        if len(profiles) > 1:
+            print(f"Profile: {profile.name}  ({profile.home})")
 
-    if args.cmd == "tags":
-        sid = resolve_sid(conn, args.session_id)
-        set_tags(meta, sid, args.tags)
-        log_operation(meta, "tags", sid, "single", False, {"tags": args.tags})
-        print(f"Tags updated: {sid}")
+        if args.cmd == "archive":
+            run_archive(args, conn, schema, meta)
+        elif args.cmd == "restore":
+            run_restore(args, conn, schema, meta)
+        elif args.cmd == "delete":
+            run_delete(args, conn, schema, meta, hermes_home=profile.home)
+        elif args.cmd == "note":
+            set_note(meta, sid, " ".join(args.note))
+            log_operation(meta, "note", sid, "single", {"note": " ".join(args.note)})
+            print(f"Note updated: {sid}")
+        elif args.cmd == "tags":
+            set_tags(meta, sid, args.tags)
+            log_operation(meta, "tags", sid, "single", {"tags": args.tags})
+            print(f"Tags updated: {sid}")
+        conn.close()
+        meta.close()
         return
 
     if args.cmd == "graveyard":
-        print_graveyard(meta, args.limit)
+        for profile in profiles:
+            conn, meta, schema = open_profile(profile)
+            if len(profiles) > 1:
+                print(f"\n## Profile: {profile.name}  ({profile.home})")
+            print_graveyard(meta, args.limit)
+            conn.close()
+            meta.close()
         return
 
     if args.cmd == "ops":
-        print_ops(meta, args.session_id, args.limit)
+        for profile in profiles:
+            conn, meta, schema = open_profile(profile)
+            if len(profiles) > 1:
+                print(f"\n## Profile: {profile.name}  ({profile.home})")
+            print_ops(meta, args.session_id, args.limit)
+            conn.close()
+            meta.close()
         return
 
-    if args.legacy_session_id:
-        show_conversation(conn, schema, meta, args.legacy_session_id)
-        return
-
-    print_list(conn, schema, meta, args.limit, state_filter="active")
+    parser.print_help()
 
 
 if __name__ == "__main__":
     main()
-
